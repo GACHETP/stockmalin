@@ -1,13 +1,14 @@
 """StockMalin desktop (Tkinter, standard library). All purchasing is manual."""
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
-import pathlib, json, csv, datetime, urllib.request, urllib.parse, re, os
+import pathlib, json, csv, datetime, urllib.request, urllib.parse, re, os, webbrowser, threading
+import scanner
 
 APPDIR=pathlib.Path(os.environ.get('APPDATA',str(pathlib.Path.home()))) / 'StockMalin'
 APPDIR.mkdir(parents=True,exist_ok=True)
 STATE=APPDIR/'state.json'
 BLUE='#2563eb'; DARK='#15213b'; BG='#f4f7fb'; GREEN='#167d57'
-INITIAL={'repo':'','products':[{'id':'fairy-platinum-plus-30min','name':'Fairy Platinum Plus 30 minutes','unit':'capsule','quantity':130,'target_unit_price':0.13,'offers':[]}],'purchases':[{'id':'fairy-platinum-plus-30min','date':'2026-10-06','shop':'Achat de référence','quantity':130,'paid':22.0}],'history':[]}
+INITIAL={'repo':'GACHETP/stockmalin','products':[{'id':'fairy-platinum-plus-30min','name':'Fairy Platinum Plus 30 minutes','unit':'capsule','quantity':130,'target_unit_price':0.13,'offers':[],'auto_search':True},{'id':'le-chat-sensitive-zero','name':'Lessive Le Chat Sensitive 0%','unit':'lavage','quantity':0,'target_unit_price':0,'offers':[],'auto_search':True}],'purchases':[{'id':'fairy-platinum-plus-30min','date':'2026-10-06','shop':'Achat de référence','quantity':130,'paid':22.0}],'history':[]}
 
 def load(path,default):
     try: return json.loads(path.read_text(encoding='utf-8'))
@@ -34,9 +35,9 @@ class App(tk.Tk):
         ttk.Label(self,text='Achetez au bon prix. Aucun achat automatique.',foreground='#66758e').pack(anchor='w',padx=24,pady=(0,10))
         self.tabs=ttk.Notebook(self);self.tabs.pack(fill='both',expand=True,padx=18,pady=(0,16))
         self.frames={}
-        for key in ('Tableau de bord','Mes produits','Mes achats','Offres et historique','Paramètres'):
+        for key in ('Tableau de bord','Rechercher un produit','Mes produits','Mes achats','Offres et historique','Paramètres'):
             frame=ttk.Frame(self.tabs,padding=14);self.tabs.add(frame,text=key);self.frames[key]=frame
-        self.make_dashboard(); self.make_products();self.make_purchases();self.make_history();self.make_settings();self.refresh()
+        self.make_dashboard(); self.make_products();self.make_purchases();self.make_history();self.make_settings();self.make_search();self.refresh()
     def save(self): store(STATE,self.state_data)
     def tree(self,parent,cols,widths=None):
         holder=ttk.Frame(parent);holder.pack(fill='both',expand=True,pady=8)
@@ -57,39 +58,95 @@ class App(tk.Tk):
         self.detail=ttk.Label(f,text='',justify='left',font=('Segoe UI',11));self.detail.pack(anchor='w',pady=10)
         ttk.Label(f,text='Les prix collectés sont indicatifs : vérifier le panier, la livraison et les coupons avant achat.',foreground='#66758e').pack(anchor='w')
         self.chart.bind('<Configure>',lambda e:self.draw_chart())
+    def make_search(self):
+        f=self.frames['Rechercher un produit']
+        ttk.Label(f,text='Indiquez simplement le nom du produit',font=('Segoe UI',17,'bold')).pack(anchor='w',pady=12)
+        ttk.Label(f,text='Recherche expérimentale chez les marchands indexés. Les prix non vérifiables sont exclus.').pack(anchor='w')
+        bar=ttk.Frame(f);bar.pack(fill='x',pady=10)
+        self.search_query=tk.StringVar(value='Fairy Platinum Plus 30 minutes')
+        ttk.Entry(bar,textvariable=self.search_query,font=('Segoe UI',13)).pack(side='left',fill='x',expand=True,padx=(0,10))
+        ttk.Button(bar,text='Rechercher',command=self.search_now).pack(side='left')
+        ttk.Button(bar,text='Voir toutes les offres',command=self.open_search).pack(side='left',padx=7)
+        ttk.Button(f,text='Ajouter ce produit à ma surveillance',command=self.add_searched).pack(anchor='w',pady=10)
+        self.search_status=ttk.Label(f,text='Aucun achat ne peut être effectué depuis StockMalin.')
+        self.search_status.pack(anchor='w',pady=8)
+        self.search_tree=self.tree(f,('Marchand','Prix affiché','Format détecté','Prix / unité','Adresse'))
+        ttk.Button(f,text='Ouvrir la page du marchand sélectionné',command=self.open_selected).pack(anchor='w')
+        self.search_results=[]
+    def open_search(self):
+        name=self.search_query.get().strip()
+        if name:webbrowser.open('https://www.google.com/search?'+urllib.parse.urlencode({'q':name+' acheter prix'}))
+    def add_searched(self):
+        name=self.search_query.get().strip()
+        if not name:return messagebox.showwarning('Produit','Entrez le nom du produit.')
+        for p in self.state_data['products']:
+            if p['name'].casefold()==name.casefold():return messagebox.showinfo('Déjà suivi','Ce produit figure déjà dans votre liste.')
+        import uuid
+        obj={'id':str(uuid.uuid4()),'name':name,'unit':'à déterminer','quantity':0,'target_unit_price':0,'auto_search':True,'offers':[]}
+        self.state_data['products'].append(obj);self.save();self.refresh()
+        messagebox.showinfo('Produit enregistré','Ajouté à la liste locale. Exportez products.json pour activer la surveillance GitHub. Les quantités et les prix seront recherchés automatiquement quand ils sont accessibles.')
+    def search_now(self):
+        name=self.search_query.get().strip()
+        if not name:return
+        self.search_status.config(text='Recherche en cours…')
+        for item in self.search_tree.get_children():self.search_tree.delete(item)
+        def worker():
+            try:
+                outcome=scanner.discover_prices({'name':name,'offers':[]})
+                self.after(0,lambda:self.show_search_results(outcome))
+            except Exception as exc:
+                detail=str(exc)
+                self.after(0,lambda:self.search_status.config(text='Recherche impossible : '+detail))
+        threading.Thread(target=worker,daemon=True).start()
+    def show_search_results(self,rows):
+        self.search_results=rows
+        for i,item in enumerate(rows):
+            self.search_tree.insert('','end',iid=str(i),values=(item['shop'],euro(item['price']),str(item['quantity'])+' '+item['unit'] if item.get('quantity') else 'Non vérifié',euro(item['unit_price'],3) if item.get('unit_price') is not None else '—',item['url']))
+        self.search_status.config(text=(f'{len(rows)} offres trouvées, dont {sum(r.get("unit_price") is not None for r in rows)} avec prix unitaire exploitable. Vérifiez les promotions et la livraison avant achat.' if rows else 'Aucun prix structuré accessible. Essayez « Voir toutes les offres » pour une recherche web.'))
+    def open_selected(self):
+        selection=self.search_tree.selection()
+        if selection:webbrowser.open(self.search_results[int(selection[0])]['url'])
+
     def make_products(self):
         f=self.frames['Mes produits'];self.row(f,self.btn('＋ Ajouter un produit',self.add_product),self.btn('✎ Modifier',self.edit_product),self.btn('Supprimer',self.delete_product),self.btn('Exporter products.json',self.export_products),self.btn('Importer products.json',self.import_products))
-        self.products_tree=self.tree(f,('Produit','Unité','Format','Seuil / unité','Liens suivis'))
-        ttk.Label(f,text='Pour la surveillance distante, exportez products.json puis mettez-le à jour dans le dépôt GitHub.',foreground='#66758e').pack(anchor='w',pady=6)
+        self.products_tree=self.tree(f,('Produit','Unité','Format','Seuil / unité','Liens facultatifs'))
+        ttk.Label(f,text='Ajoutez un produit par son nom. Pour la surveillance PC éteint, exportez ensuite products.json vers GitHub.',foreground='#66758e').pack(anchor='w',pady=6)
     def product_form(self,product=None):
-        w=tk.Toplevel(self);w.title('Fiche produit');w.transient(self);w.grab_set();w.geometry('690x510')
-        fields=[('Nom du produit','name'),('Unité (capsule, rouleau, litre...)','unit'),('Nombre d’unités par paquet','quantity'),('Seuil d’alerte en € par unité','target_unit_price')]
-        vars={}
-        for label,key in fields:
-            row=ttk.Frame(w,padding=(14,7));row.pack(fill='x');ttk.Label(row,text=label,width=34).pack(side='left');v=tk.StringVar(value=str((product or {}).get(key,'')));ttk.Entry(row,textvariable=v,width=35).pack(side='left');vars[key]=v
-        ttk.Label(w,text='Liens marchands : un par ligne sous la forme Boutique | URL HTTPS | Quantité | Livraison (€)',wraplength=630).pack(anchor='w',padx=14,pady=8)
-        txt=tk.Text(w,height=9,font=('Consolas',10));txt.pack(fill='both',expand=True,padx=14)
-        if product:
-            txt.insert('1.0','\n'.join(f"{o.get('shop','Boutique')} | {o.get('url','')} | {o.get('quantity',product.get('quantity',1))} | {o.get('shipping',0)}" for o in product.get('offers',[])))
+        w=tk.Toplevel(self);w.title('Ajouter un produit');w.transient(self);w.grab_set();w.geometry('620x390')
+        ttk.Label(w,text='Quel produit souhaitez-vous surveiller ?',font=('Segoe UI',15,'bold')).pack(anchor='w',padx=18,pady=(18,6))
+        name_var=tk.StringVar(value=(product or {}).get('name',''))
+        entry=ttk.Entry(w,textvariable=name_var,font=('Segoe UI',13));entry.pack(fill='x',padx=18,pady=5);entry.focus_set()
+        ttk.Label(w,text='Un nom approximatif suffit. Les formats et prix seront cherchés automatiquement.',wraplength=570).pack(anchor='w',padx=18,pady=5)
+        advanced=ttk.LabelFrame(w,text='Options facultatives',padding=10);advanced.pack(fill='both',expand=True,padx=18,pady=12)
+        ttk.Label(advanced,text='Prix cible par unité (€) — laisser vide si inconnu').pack(anchor='w')
+        target_var=tk.StringVar(value=str((product or {}).get('target_unit_price') or ''))
+        ttk.Entry(advanced,textvariable=target_var).pack(fill='x',pady=5)
+        ttk.Label(advanced,text='Liens précis facultatifs : Boutique | URL HTTPS | Quantité | Livraison (€)').pack(anchor='w',pady=(8,0))
+        txt=tk.Text(advanced,height=3,font=('Consolas',9));txt.pack(fill='both',expand=True)
+        for o in (product or {}).get('offers',[]):
+            txt.insert('end',f"{o.get('shop','Boutique')} | {o.get('url','')} | {o.get('quantity',1)} | {o.get('shipping',0)}\n")
         def submit():
             try:
-                name=vars['name'].get().strip();unit=vars['unit'].get().strip() or 'unité';q=int(vars['quantity'].get());target=float(vars['target_unit_price'].get().replace(',','.'))
-                if not name or q<=0 or target<=0: raise ValueError('Nom, quantité et seuil doivent être valides')
+                name=name_var.get().strip()
+                if not name: raise ValueError('Entrez un nom de produit.')
+                target=float(target_var.get().replace(',','.')) if target_var.get().strip() else 0.0
+                if target<0: raise ValueError('Le seuil doit être positif.')
                 offers=[]
                 for line in txt.get('1.0','end').splitlines():
                     if not line.strip():continue
-                    parts=[x.strip() for x in line.split('|')]
-                    if len(parts)!=4 or not parts[1].startswith('https://'):raise ValueError('Format de lien incorrect : Boutique | https://... | quantité | livraison')
-                    count=int(parts[2]);shipping=float(parts[3].replace(',','.'))
-                    if count<=0 or shipping<0:raise ValueError('Quantité ou frais invalides')
-                    offers.append({'shop':parts[0],'url':parts[1],'quantity':count,'shipping':shipping})
-                ident=(product or {}).get('id') or re.sub('[^a-z0-9]+','-',name.lower()).strip('-')+'-'+str(len(self.state_data['products'])+1)
-                obj={'id':ident,'name':name,'unit':unit,'quantity':q,'target_unit_price':target,'offers':offers}
-                if product: self.state_data['products'][self.state_data['products'].index(product)]=obj
+                    parts=[v.strip() for v in line.split('|')]
+                    if len(parts)!=4 or not parts[1].startswith('https://'):raise ValueError('Lien : Boutique | https://... | quantité | livraison')
+                    qty=int(parts[2]); shipping=float(parts[3].replace(',','.'))
+                    if qty<=0 or shipping<0:raise ValueError('Quantité ou livraison invalide')
+                    offers.append({'shop':parts[0],'url':parts[1],'quantity':qty,'shipping':shipping})
+                import uuid
+                obj=dict(product or {})
+                obj.update({'id':obj.get('id') or str(uuid.uuid4()),'name':name,'auto_search':True,'unit':obj.get('unit','à déterminer'),'quantity':obj.get('quantity',0),'target_unit_price':target,'offers':offers})
+                if product:self.state_data['products'][self.state_data['products'].index(product)]=obj
                 else:self.state_data['products'].append(obj)
                 self.save();self.refresh();w.destroy()
-            except Exception as e: messagebox.showerror('Fiche produit',str(e),parent=w)
-        ttk.Button(w,text='Enregistrer',command=submit).pack(pady=12)
+            except Exception as exc:messagebox.showerror('Produit',str(exc),parent=w)
+        ttk.Button(w,text='Enregistrer le produit',command=submit).pack(pady=(0,15))
         self.wait_window(w)
     def selected_product(self):
         ids=self.products_tree.selection()
@@ -191,7 +248,7 @@ class App(tk.Tk):
         if products and self.current_product.get() not in [p['name'] for p in products]:self.current_product.set(products[0]['name'])
         for t in (self.products_tree,self.purchase_tree,self.history_tree):
             for item in t.get_children():t.delete(item)
-        for i,p in enumerate(products):self.products_tree.insert('', 'end',iid=str(i),values=(p['name'],p.get('unit','unité'),p.get('quantity',1),euro(float(p.get('target_unit_price',0)),3),len(p.get('offers',[]))))
+        for i,p in enumerate(products):self.products_tree.insert('', 'end',iid=str(i),values=(p['name'],p.get('unit','unité'),p.get('quantity') or 'Auto',euro(float(p.get('target_unit_price',0)),3) if p.get('target_unit_price') else 'Auto',len(p.get('offers',[]))))
         for i,p in enumerate(purchases):
             q=p.get('quantity',1);self.purchase_tree.insert('','end',iid=str(i),values=(p.get('date'),mapping.get(p.get('id'),{}).get('name',p.get('id')),p.get('shop'),q,euro(float(p['paid'])),euro(float(p['paid'])/q,3)))
         baselines={}
