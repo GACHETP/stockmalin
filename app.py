@@ -61,7 +61,7 @@ class App(tk.Tk):
     def make_search(self):
         f=self.frames['Rechercher un produit']
         ttk.Label(f,text='Indiquez simplement le nom du produit',font=('Segoe UI',17,'bold')).pack(anchor='w',pady=12)
-        ttk.Label(f,text='Recherche expérimentale chez les marchands indexés. Les prix non vérifiables sont exclus.').pack(anchor='w')
+        ttk.Label(f,text='Recherche automatique expérimentale : offres trouvées et échecs visibles, sans inventer les prix.').pack(anchor='w')
         bar=ttk.Frame(f);bar.pack(fill='x',pady=10)
         self.search_query=tk.StringVar(value='Fairy Platinum Plus 30 minutes')
         ttk.Entry(bar,textvariable=self.search_query,font=('Segoe UI',13)).pack(side='left',fill='x',expand=True,padx=(0,10))
@@ -70,7 +70,7 @@ class App(tk.Tk):
         ttk.Button(f,text='Ajouter ce produit à ma surveillance',command=self.add_searched).pack(anchor='w',pady=10)
         self.search_status=ttk.Label(f,text='Aucun achat ne peut être effectué depuis StockMalin.')
         self.search_status.pack(anchor='w',pady=8)
-        self.search_tree=self.tree(f,('Marchand','Prix affiché','Format détecté','Prix / unité','Adresse'))
+        self.search_tree=self.tree(f,('Marchand','Prix affiché','Format détecté','Prix / unité','État / diagnostic','Adresse'))
         ttk.Button(f,text='Ouvrir la page du marchand sélectionné',command=self.open_selected).pack(anchor='w')
         self.search_results=[]
     def open_search(self):
@@ -101,8 +101,10 @@ class App(tk.Tk):
     def show_search_results(self,rows):
         self.search_results=rows
         for i,item in enumerate(rows):
-            self.search_tree.insert('','end',iid=str(i),values=(item['shop'],euro(item['price']),str(item['quantity'])+' '+item['unit'] if item.get('quantity') else 'Non vérifié',euro(item['unit_price'],3) if item.get('unit_price') is not None else '—',item['url']))
-        self.search_status.config(text=(f'{len(rows)} offres trouvées, dont {sum(r.get("unit_price") is not None for r in rows)} avec prix unitaire exploitable. Vérifiez les promotions et la livraison avant achat.' if rows else 'Aucun prix structuré accessible. Essayez « Voir toutes les offres » pour une recherche web.'))
+            qty=item.get('quantity');unit=item.get('unit') or 'unité'
+            self.search_tree.insert('','end',iid=str(i),values=(item['shop'],euro(item['price']) if item.get('price') is not None else '—',f'{qty} {unit}' if qty else 'Inconnu',euro(item['unit_price'],3) if item.get('unit_price') is not None else '—',item.get('status','À vérifier')+' : '+item.get('detail',''),item['url']))
+        verified=sum(r.get('unit_price') is not None for r in rows)
+        self.search_status.config(text=(f'{len(rows)} pages candidates • {verified} prix unitaires détectés (livraison souvent exclue). Cliquez sur une ligne pour vérifier.' if rows else 'Aucune page marchande trouvée par la source de recherche. Essayez « Voir toutes les offres »; le moteur ne couvre pas tous les magasins.'))
     def open_selected(self):
         selection=self.search_tree.selection()
         if selection:webbrowser.open(self.search_results[int(selection[0])]['url'])

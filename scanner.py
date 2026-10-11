@@ -84,41 +84,43 @@ def shop_name(url):
         if host==domain or host.endswith('.'+domain): return label
     return None
 
-def discover_urls(name, max_results=12):
-    # Bing RSS is a discovery source, not a price API. Search results may be incomplete.
-    queries=[f'{name} acheter prix site:amazon.fr OR site:cdiscount.com',
-             f'{name} acheter site:carrefour.fr OR site:auchan.fr']
-    urls=[]
+def discover_candidates(name, max_results=18):
+    """Discover candidate product pages via public indexed RSS, not a price API.
+    Return both URL and search-engine title to diagnose inaccessible merchants.
+    """
+    queries=[f'"{name}" acheter prix', f'{name} lessive capsules promotion site:carrefour.fr OR site:auchan.fr',
+             f'{name} site:amazon.fr OR site:cdiscount.com']
+    candidates=[]; seen=set()
     for query in queries:
         try:
             endpoint='https://www.bing.com/search?'+urllib.parse.urlencode({'q':query,'format':'rss'})
-            request=urllib.request.Request(endpoint,headers={'User-Agent':'Mozilla/5.0 (StockMalin price research)'})
-            with urllib.request.urlopen(request,timeout=12) as response:
-                payload=response.read(400000)
+            request=urllib.request.Request(endpoint,headers={'User-Agent':'Mozilla/5.0','Accept-Language':'fr-FR,fr;q=0.9'})
+            with urllib.request.urlopen(request,timeout=12) as response: payload=response.read(500000)
             root=ET.fromstring(payload)
             for item in root.findall('.//item'):
                 link=(item.findtext('link') or '').strip()
                 title=(item.findtext('title') or '').strip()
-                if link.startswith('https://') and shop_name(link) and link not in urls:
-                    # Require multiple identifying words to prevent obviously wrong offers.
-                    terms=[x for x in re.findall(r'[a-z0-9]+',name.lower()) if len(x)>3]
-                    normalized=title.lower()
-                    if terms and sum(t in normalized for t in terms)<min(2,len(terms)): continue
-                    urls.append(link)
-                    if len(urls)>=max_results:return urls
-        except (ValueError,ET.ParseError,OSError):pass
-    return urls
+                if not link.startswith('https://') or not shop_name(link) or link in seen: continue
+                if not product_match(name,title):continue
+                seen.add(link);candidates.append({'url':link,'title':title,'shop':shop_name(link)})
+                if len(candidates)>=max_results:return candidates
+        except (ValueError,ET.ParseError,OSError):continue
+    return candidates
+
+def discover_urls(name,max_results=12):
+    return [x['url'] for x in discover_candidates(name,max_results)]
 
 def normalized(value):
     value=unicodedata.normalize('NFKD',value.casefold())
     return ''.join(ch for ch in value if not unicodedata.combining(ch))
 
 def product_match(search, title):
-    # Prevent matching a completely different product/variant from a loose query.
-    skip={'lessive','capsules','capsule','lavage','lave','vaisselle','liquide','pour','avec','lot','pack','de','des','le','la','les','x','en','0'}
-    terms=[x for x in re.findall(r'[a-z0-9]+',normalized(search)) if x not in skip and len(x)>2]
-    hay=normalized(title)
-    return bool(terms) and all(term in hay for term in terms)
+    skip={'lessive','capsules','capsule','lavage','lave','vaisselle','liquide','pour','avec','lot','pack','de','des','le','la','les','x','en','0','prix','promotion'}
+    def tokens(v):return [x for x in re.findall(r'[a-z0-9]+',normalized(v)) if x not in skip and len(x)>2]
+    wanted=tokens(search); found=tokens(title)
+    if not wanted:return False
+    # Name variants can have minor plural/suffix differences; require all identifying terms.
+    return all(any(a==b or (len(a)>=5 and len(b)>=5 and a[:5]==b[:5]) for b in found) for a in wanted)
 
 def infer_pack(title, name):
     text=normalized(title+' '+name)
@@ -156,23 +158,43 @@ def fetch_offer(url):
     return price,method,page_title or ''
 
 def discover_prices(product):
-    found=[];urls=discover_urls(product['name'])
+    """Return checked prices AND visibly flagged candidate pages.
+    An inaccessible page or unverifiable price is never treated as a deal.
+    """
+    candidates=discover_candidates(product['name'])
     known={o.get('url'):o for o in product.get('offers',[]) if o.get('url')}
-    for url in dict.fromkeys(urls+list(known)):
+    for url in known:
+        if url not in {x['url'] for x in candidates}:
+            candidates.append({'url':url,'title':product['name'],'shop':shop_name(url) or known[url].get('shop','Marchand')})
+    results=[]
+    for item in candidates:
+        url=item['url']; title=item['title']; shop=item['shop']
+        base={'url':url,'shop':shop,'title':title,'price':None,'quantity':None,'unit':None,'unit_price':None,'shipping':None,'method':None,'status':'À vérifier','detail':''}
         try:
-            price,method,title=fetch_offer(url)
-            if not product_match(product['name'],title):continue
+            price,method,page_title=fetch_offer(url)
+            if page_title and not product_match(product['name'],page_title):
+                base['detail']='Référence potentiellement différente';results.append(base);continue
+            title=page_title or title
             qty,unit=infer_pack(title,'')
             if not qty and url in known:
                 qty=int(known[url].get('quantity') or 0) or None
                 unit=product.get('unit') if qty else None
-            shipping=float(known.get(url,{}).get('shipping',0) or 0)
-            # Unknown delivery fees or conditional coupons: don't invent a final price.
-            unit_price=round((price+shipping)/qty,5) if qty else None
-            found.append({'url':url,'shop':shop_name(url),'title':title,'price':round(price,2),'quantity':qty,'unit':unit,'unit_price':unit_price,'shipping':shipping,'method':method})
-        except (OSError,ValueError,TypeError):pass
+            shipping=known[url].get('shipping') if url in known else None
+            base.update({'title':title,'price':round(price,2),'quantity':qty,'unit':unit,'shipping':shipping,'method':method})
+            if not qty:
+                base['detail']='Prix détecté, mais quantité non identifiée'
+            elif shipping is None:
+                base['detail']='Prix hors livraison; promotions à vérifier'
+                base['unit_price']=round(price/qty,5)
+                base['status']='Prix hors livraison'
+            else:
+                base['unit_price']=round((price+float(shipping))/qty,5)
+                base['status']='Prix vérifié (livraison déclarée)'
+        except Exception as exc:
+            base['detail']=str(exc)[:150]
+        results.append(base)
         time.sleep(0.25)
-    return sorted(found,key=lambda x:(x['unit_price'] is None,x['unit_price'] or float('inf')))
+    return sorted(results,key=lambda x:(x['unit_price'] is None,x['unit_price'] if x['unit_price'] is not None else float('inf')))
 
 def scan():
     products=load(ROOT/'products.json',[])
@@ -182,8 +204,8 @@ def scan():
     for product in products:
         found=discover_prices(product) if product.get('auto_search',True) else []
         for offer in found:
-            if offer['unit_price'] is None:
-                results.append({'product':product['name'],'shop':offer['shop'],'status':'A_VERIFIER','url':offer['url'],'price':offer['price'],'detail':'Quantité non déterminée'})
+            if offer['unit_price'] is None or offer['shipping'] is None:
+                results.append({'product':product['name'],'shop':offer['shop'],'status':'A_VERIFIER','url':offer['url'],'price':offer['price'],'detail':offer['detail']})
                 continue
             record={'timestamp':stamp,'id':product['id'],'name':product['name'],'shop':offer['shop'],'url':offer['url'],'title':offer['title'],'quantity':offer['quantity'],'unit':offer['unit'],'price':offer['price'],'shipping':offer['shipping'],'total':round(offer['price']+offer['shipping'],2),'unit_price':offer['unit_price'],'method':offer['method']}
             if (record['id'],record['url'],stamp) not in seen:history.append(record)
