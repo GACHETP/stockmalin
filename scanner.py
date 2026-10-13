@@ -84,27 +84,70 @@ def shop_name(url):
         if host==domain or host.endswith('.'+domain): return label
     return None
 
-def discover_candidates(name, max_results=18):
-    """Discover candidate product pages via public indexed RSS, not a price API.
-    Return both URL and search-engine title to diagnose inaccessible merchants.
+class SearchLinkParser(HTMLParser):
+    """Parse DuckDuckGo HTML and Bing result headings; never guess product prices."""
+    def __init__(self):
+        super().__init__(); self.results=[]; self.active=None; self.text=[]; self.bing_h2=False
+    def handle_starttag(self, tag, attrs):
+        d=dict(attrs)
+        if tag=='h2': self.bing_h2=True
+        if tag=='a' and ('result__a' in d.get('class','') or self.bing_h2):
+            self.active=d.get('href',''); self.text=[]
+    def handle_data(self, value):
+        if self.active is not None:self.text.append(value)
+    def handle_endtag(self,tag):
+        if tag=='a' and self.active is not None:
+            self.results.append((self.active,html.unescape(' '.join(self.text)).strip()))
+            self.active=None
+        if tag=='h2':self.bing_h2=False
+
+def canonical_result_url(raw):
+    raw=html.unescape(raw)
+    if raw.startswith('//'):raw='https:'+raw
+    parsed=urllib.parse.urlparse(raw)
+    if parsed.hostname and parsed.hostname.endswith('duckduckgo.com'):
+        raw=urllib.parse.parse_qs(parsed.query).get('uddg',[''])[0]
+        parsed=urllib.parse.urlparse(raw)
+    if parsed.scheme!='https' or not shop_name(raw):return None
+    return urllib.parse.urlunparse(parsed._replace(fragment=''))
+
+def search_web(name,diagnostics=None):
+    """Best effort search: independent public HTML indexes, then legacy RSS.
+    Search engines can block requests; this is NOT a guaranteed shopping API.
     """
-    queries=[f'"{name}" acheter prix', f'{name} lessive capsules promotion site:carrefour.fr OR site:auchan.fr',
-             f'{name} site:amazon.fr OR site:cdiscount.com']
-    candidates=[]; seen=set()
-    for query in queries:
+    query=name+' acheter prix'
+    sources=[('DuckDuckGo','https://html.duckduckgo.com/html/?'+urllib.parse.urlencode({'q':query})),
+             ('Bing','https://www.bing.com/search?'+urllib.parse.urlencode({'q':query,'setlang':'fr'})),
+             ('Bing RSS','https://www.bing.com/search?'+urllib.parse.urlencode({'q':query,'format':'rss'}))]
+    for source,url in sources:
         try:
-            endpoint='https://www.bing.com/search?'+urllib.parse.urlencode({'q':query,'format':'rss'})
-            request=urllib.request.Request(endpoint,headers={'User-Agent':'Mozilla/5.0','Accept-Language':'fr-FR,fr;q=0.9'})
-            with urllib.request.urlopen(request,timeout=12) as response: payload=response.read(500000)
-            root=ET.fromstring(payload)
-            for item in root.findall('.//item'):
-                link=(item.findtext('link') or '').strip()
-                title=(item.findtext('title') or '').strip()
-                if not link.startswith('https://') or not shop_name(link) or link in seen: continue
-                if not product_match(name,title):continue
-                seen.add(link);candidates.append({'url':link,'title':title,'shop':shop_name(link)})
-                if len(candidates)>=max_results:return candidates
-        except (ValueError,ET.ParseError,OSError):continue
+            request=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36','Accept-Language':'fr-FR,fr;q=0.9'})
+            with urllib.request.urlopen(request,timeout=10) as response:
+                payload=response.read(800000).decode('utf-8','replace')
+            if source=='Bing RSS':
+                root=ET.fromstring(payload)
+                links=[(item.findtext('link') or '', item.findtext('title') or '') for item in root.findall('.//item')]
+            else:
+                parser=SearchLinkParser();parser.feed(payload);links=parser.results
+            if diagnostics is not None:diagnostics.append(source+': '+str(len(links))+' liens détectés')
+            yield from links
+        except Exception as exc:
+            if diagnostics is not None:diagnostics.append(source+': '+type(exc).__name__+' '+str(exc)[:90])
+
+def discover_candidates(name, max_results=18, diagnostics=None):
+    """Discover plausible listings from several indexes; preserve source titles.
+    An unavailable price never becomes a fabricated offer.
+    """
+    candidates=[];seen=set(); rejected=0
+    for raw,title in search_web(name,diagnostics):
+        url=canonical_result_url(raw)
+        if not url or url in seen:continue
+        if not product_match(name,title):
+            rejected+=1;continue
+        candidates.append({'url':url,'title':title,'shop':shop_name(url)})
+        seen.add(url)
+        if len(candidates)>=max_results:break
+    if diagnostics is not None:diagnostics.append('Candidats retenus: '+str(len(candidates))+', titres exclus: '+str(rejected))
     return candidates
 
 def discover_urls(name,max_results=12):
@@ -115,7 +158,7 @@ def normalized(value):
     return ''.join(ch for ch in value if not unicodedata.combining(ch))
 
 def product_match(search, title):
-    skip={'lessive','capsules','capsule','lavage','lave','vaisselle','liquide','pour','avec','lot','pack','de','des','le','la','les','x','en','0','prix','promotion'}
+    skip={'lessive','capsules','capsule','lavage','lave','vaisselle','liquide','pour','avec','lot','pack','de','des','le','la','les','x','en','0','prix','promotion','minutes','minute','min'}
     def tokens(v):return [x for x in re.findall(r'[a-z0-9]+',normalized(v)) if x not in skip and len(x)>2]
     wanted=tokens(search); found=tokens(title)
     if not wanted:return False
@@ -157,11 +200,11 @@ def fetch_offer(url):
     price,method=fetch_price(url)
     return price,method,page_title or ''
 
-def discover_prices(product):
+def discover_prices(product, diagnostics=None):
     """Return checked prices AND visibly flagged candidate pages.
     An inaccessible page or unverifiable price is never treated as a deal.
     """
-    candidates=discover_candidates(product['name'])
+    candidates=discover_candidates(product['name'], diagnostics=diagnostics)
     known={o.get('url'):o for o in product.get('offers',[]) if o.get('url')}
     for url in known:
         if url not in {x['url'] for x in candidates}:
@@ -192,6 +235,7 @@ def discover_prices(product):
                 base['status']='Prix vérifié (livraison déclarée)'
         except Exception as exc:
             base['detail']=str(exc)[:150]
+            if diagnostics is not None: diagnostics.append(shop+': '+base['detail'])
         results.append(base)
         time.sleep(0.25)
     return sorted(results,key=lambda x:(x['unit_price'] is None,x['unit_price'] if x['unit_price'] is not None else float('inf')))

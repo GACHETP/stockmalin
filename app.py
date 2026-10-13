@@ -92,19 +92,20 @@ class App(tk.Tk):
         for item in self.search_tree.get_children():self.search_tree.delete(item)
         def worker():
             try:
-                outcome=scanner.discover_prices({'name':name,'offers':[]})
-                self.after(0,lambda:self.show_search_results(outcome))
+                diagnostics=[]
+                outcome=scanner.discover_prices({'name':name,'offers':[]}, diagnostics=diagnostics)
+                self.after(0,lambda:self.show_search_results(outcome,diagnostics))
             except Exception as exc:
                 detail=str(exc)
                 self.after(0,lambda:self.search_status.config(text='Recherche impossible : '+detail))
         threading.Thread(target=worker,daemon=True).start()
-    def show_search_results(self,rows):
+    def show_search_results(self,rows,diagnostics=None):
         self.search_results=rows
         for i,item in enumerate(rows):
             qty=item.get('quantity');unit=item.get('unit') or 'unité'
             self.search_tree.insert('','end',iid=str(i),values=(item['shop'],euro(item['price']) if item.get('price') is not None else '—',f'{qty} {unit}' if qty else 'Inconnu',euro(item['unit_price'],3) if item.get('unit_price') is not None else '—',item.get('status','À vérifier')+' : '+item.get('detail',''),item['url']))
         verified=sum(r.get('unit_price') is not None for r in rows)
-        self.search_status.config(text=(f'{len(rows)} pages candidates • {verified} prix unitaires détectés (livraison souvent exclue). Cliquez sur une ligne pour vérifier.' if rows else 'Aucune page marchande trouvée par la source de recherche. Essayez « Voir toutes les offres »; le moteur ne couvre pas tous les magasins.'))
+        self.search_status.config(text=(f'{len(rows)} pages candidates • {verified} prix unitaires détectés (livraison souvent exclue). Cliquez sur une ligne pour vérifier.' if rows else 'Aucune fiche marchande confirmée. Diagnostic : '+(' | '.join((diagnostics or [])[-4:]) or 'sources inaccessibles')))
     def open_selected(self):
         selection=self.search_tree.selection()
         if selection:webbrowser.open(self.search_results[int(selection[0])]['url'])
